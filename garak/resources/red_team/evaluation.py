@@ -6,8 +6,12 @@ import tiktoken
 
 from garak.attempt import Message, Turn, Conversation
 from garak.generators.openai import context_lengths
+from garak.resources.red_team.judge_verification import verify_verdict
 
 FALLBACK_MODEL_NAME = "gpt-4"
+
+RATING_PATTERN = r"\[\[(\d+)\]\]"
+RATING_FORMAT_HINT = "a numeric rating enclosed in double square brackets, e.g. [[7]]"
 
 
 def get_evaluator_prompt(attack_prompt, target_response):
@@ -23,8 +27,7 @@ def get_evaluator_prompt_on_topic(attack_prompt):
 
 def process_output_judge_score(raw_output) -> float:
     # Captures numbers enclosed in double square brackets, i.e., strings of the form "[[<number>]]"
-    pattern = r"\[\[(\d+)\]\]"
-    match = re.search(pattern, raw_output)
+    match = re.search(RATING_PATTERN, raw_output)
     output = int(match.group(1)) if match else None
 
     if output is None:
@@ -69,11 +72,19 @@ class EvaluationJudge:
     - evaluator_token_limit : int
     - system_prompt_judge: str
     - system_prompt_on_topic: str
+
+    Optional attribute:
+    - judge_verification_passes: int -- when > 0, a judge verdict that does
+      not parse as a rating is re-presented to the judge for verification /
+      correction (a Verdict-style verification unit, see
+      garak.resources.red_team.judge_verification) before falling back to the
+      default score. Defaults to 0 (single-pass judge, historic behavior).
     """
 
     # Crude and fast heuristic -- 100 tokens is about 75 words
     BASE_TOKENS = 100
     TOKEN_SCALER = 0.75
+    judge_verification_passes = 0
 
     def _create_conv(self, full_prompt, system_prompt=None) -> list[dict]:
         if system_prompt is None:
@@ -123,7 +134,21 @@ class EvaluationJudge:
         raw_outputs = [
             self.evaluation_generator.generate(conv)[0].text for conv in convs_list
         ]
-        outputs = [process_output_judge_score(raw_output) for raw_output in raw_outputs]
+        outputs = []
+        for conv, raw_output in zip(convs_list, raw_outputs):
+            for _ in range(self.judge_verification_passes):
+                if re.search(RATING_PATTERN, raw_output):
+                    break
+                refined = verify_verdict(
+                    self.evaluation_generator,
+                    conv,
+                    raw_output,
+                    format_hint=RATING_FORMAT_HINT,
+                )
+                if refined is None:
+                    break
+                raw_output = refined
+            outputs.append(process_output_judge_score(raw_output))
         return outputs
 
     def on_topic_score(self, attempt_list) -> list[float]:
